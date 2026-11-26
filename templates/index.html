@@ -1,0 +1,173 @@
+<!DOCTYPE html>
+<html lang="pl">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Audyt Bezpieczeństwa Poczty | kmucha.pl</title>
+<style>
+  :root { --accent: #467099; --bg: #0f172a; --card: #1e293b; --text: #f1f5f9; --muted: #94a3b8; --ok: #10b981; --warn: #f59e0b; --err: #ef4444; }
+  body { font-family: system-ui, -apple-system, sans-serif; background: var(--bg); color: var(--text); margin: 0; padding: 2rem 1rem; line-height: 1.5; }
+  .container { max-width: 820px; margin: 0 auto; }
+  header { border-bottom: 1px solid #334155; padding-bottom: 1rem; margin-bottom: 2rem; display: flex; justify-content: space-between; align-items: center; }
+  h1 { font-size: 1.4rem; margin: 0; color: #fff; }
+  .badge { background: var(--accent); padding: 0.25rem 0.65rem; border-radius: 6px; font-size: 0.8rem; font-weight: 600; }
+  .card { background: var(--card); border: 1px solid #334155; border-radius: 10px; padding: 1.5rem; margin-bottom: 1.5rem; }
+  .addr-box { display: flex; gap: 0.75rem; align-items: center; background: #0f172a; padding: 0.9rem 1rem; border-radius: 8px; border: 1px solid var(--accent); margin: 1rem 0; }
+  .addr-box code { font-size: 1.15rem; color: #7dd3fc; flex: 1; word-break: break-all; }
+  button { background: var(--accent); color: #fff; border: none; padding: 0.65rem 1.1rem; border-radius: 6px; font-weight: 600; cursor: pointer; }
+  button:hover { filter: brightness(1.1); }
+  .timer { font-size: 0.95rem; color: var(--muted); }
+  .timer strong { color: #fff; font-variant-numeric: tabular-nums; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(230px, 1fr)); gap: 1rem; margin-top: 1rem; }
+  .metric { background: #0f172a; padding: 1rem; border-radius: 8px; border-left: 4px solid var(--muted); }
+  .metric.ok { border-color: var(--ok); }
+  .metric.warn { border-color: var(--warn); }
+  .metric.err { border-color: var(--err); }
+  .metric h3 { margin: 0 0 0.4rem 0; font-size: 0.95rem; text-transform: uppercase; letter-spacing: 0.04em; color: var(--muted); }
+  .metric .val { font-size: 1.05rem; font-weight: 600; }
+  pre { background: #0f172a; padding: 1rem; border-radius: 8px; overflow-x: auto; font-size: 0.82rem; color: #cbd5e1; }
+  footer { text-align: center; margin-top: 3rem; font-size: 0.85rem; color: var(--muted); }
+  footer a { color: #7dd3fc; text-decoration: none; }
+</style>
+</head>
+<body>
+<div class="container">
+  <header>
+    <h1>Audyt Bezpieczeństwa Poczty E-mail</h1>
+    <span class="badge">jasmina.kmucha.pl</span>
+  </header>
+
+  <div class="card" id="step-box">
+    <p>Wyślij dowolną wiadomość e-mail z testowanej skrzynki na poniższy jednorazowy adres. Adres jest aktywny przez <strong>30 minut</strong> i wygasa natychmiast po odebraniu wiadomości.</p>
+    <div class="addr-box">
+      <code id="test-email">Generowanie adresu...</code>
+      <button onclick="copyEmail()">Kopiuj adres</button>
+    </div>
+    <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:0.5rem;">
+      <span class="timer">Pozostały czas ważności: <strong id="countdown">30:00</strong></span>
+      <span id="status-text" style="color:#7dd3fc; font-size:0.9rem;">Oczekiwanie na wiadomość...</span>
+    </div>
+  </div>
+
+  <div id="report-box" style="display:none;">
+    <div class="card">
+      <h2 style="margin-top:0;">Wynik audytu dla domeny: <span id="rep-domain" style="color:#7dd3fc;"></span></h2>
+      <p style="color:var(--muted); font-size:0.9rem;">Nadawca: <span id="rep-from"></span> | IP serwera wysyłającego: <span id="rep-ip"></span></p>
+      <div class="grid" id="metrics-grid"></div>
+    </div>
+    <div class="card">
+      <h3 style="margin-top:0;">Szczegóły techniczne (SPF / DMARC / MTA-STS / MX)</h3>
+      <pre id="raw-json"></pre>
+      <button onclick="startNewSession()">Nowy test (wygeneruj kolejny adres)</button>
+    </div>
+  </div>
+
+  <footer>
+    Narzędzie audytowe • <a href="https://kmucha.pl" target="_blank">kmucha.pl</a>
+  </footer>
+</div>
+
+<script>
+let currentToken = null;
+let expiresAt = 0;
+let pollTimer = null;
+let clockTimer = null;
+
+async function startNewSession() {
+  clearInterval(pollTimer);
+  clearInterval(clockTimer);
+  document.getElementById('report-box').style.display = 'none';
+  document.getElementById('step-box').style.display = 'block';
+  document.getElementById('status-text').textContent = 'Oczekiwanie na wiadomość...';
+
+  const res = await fetch('/api/session', { method: 'POST' });
+  const data = await res.json();
+  currentToken = data.token;
+  expiresAt = data.expires_at;
+  document.getElementById('test-email').textContent = data.address;
+
+  clockTimer = setInterval(updateClock, 1000);
+  pollTimer = setInterval(pollSession, 3000);
+  updateClock();
+}
+
+function updateClock() {
+  const left = Math.max(0, expiresAt - Math.floor(Date.now() / 1000));
+  const m = String(Math.floor(left / 60)).padStart(2, '0');
+  const s = String(left % 60).padStart(2, '0');
+  document.getElementById('countdown').textContent = `${m}:${s}`;
+  if (left === 0) {
+    clearInterval(clockTimer);
+    clearInterval(pollTimer);
+    document.getElementById('status-text').textContent = 'Adres wygasł. Wygeneruj nowy.';
+  }
+}
+
+async function pollSession() {
+  if (!currentToken) return;
+  const res = await fetch(`/api/session/${currentToken}`);
+  if (!res.ok) return;
+  const data = await res.json();
+  if (data.status === 'done' && data.report) {
+    clearInterval(pollTimer);
+    clearInterval(clockTimer);
+    renderReport(data.report);
+  }
+}
+
+function renderReport(r) {
+  document.getElementById('step-box').style.display = 'none';
+  document.getElementById('report-box').style.display = 'block';
+  document.getElementById('rep-domain').textContent = r.sender_domain || 'nieznana';
+  document.getElementById('rep-from').textContent = r.mail_from;
+  document.getElementById('rep-ip').textContent = r.peer_ip;
+
+  const dns = r.dns_audit || {};
+  const spfValid = dns.spf && dns.spf.valid;
+  const dmarcValid = dns.dmarc && dns.dmarc.valid;
+  const dmarcPolicy = dns.dmarc && dns.dmarc.tags && dns.dmarc.tags.p ? dns.dmarc.tags.p.value : 'brak';
+  const mtaSts = dns.mta_sts && dns.mta_sts.valid;
+
+  const cards = [
+    {
+      title: 'Szyfrowanie w locie (STARTTLS)',
+      val: r.tls.encrypted ? `Tak (${r.tls.protocol})` : 'Brak szyfrowania!',
+      cls: r.tls.encrypted ? 'ok' : 'err'
+    },
+    {
+      title: 'Podpis kryptograficzny DKIM',
+      val: r.dkim.valid ? 'Poprawny podpis' : (r.dkim.has_signature ? 'Błędny podpis' : 'Brak podpisu DKIM'),
+      cls: r.dkim.valid ? 'ok' : 'err'
+    },
+    {
+      title: 'Rekord SPF',
+      val: spfValid ? 'Poprawny' : 'Błąd lub brak SPF',
+      cls: spfValid ? 'ok' : 'err'
+    },
+    {
+      title: 'Polityka DMARC',
+      val: dmarcValid ? `Aktywna (p=${dmarcPolicy})` : 'Brak DMARC',
+      cls: dmarcValid ? (dmarcPolicy === 'none' ? 'warn' : 'ok') : 'err'
+    },
+    {
+      title: 'MTA-STS',
+      val: mtaSts ? 'Wdrożony' : 'Brak MTA-STS',
+      cls: mtaSts ? 'ok' : 'warn'
+    }
+  ];
+
+  const grid = document.getElementById('metrics-grid');
+  grid.innerHTML = cards.map(c => `<div class="metric ${c.cls}"><h3>${c.title}</h3><div class="val">${c.val}</div></div>`).join('');
+  document.getElementById('raw-json').textContent = JSON.stringify(r, null, 2);
+}
+
+function copyEmail() {
+  const txt = document.getElementById('test-email').textContent;
+  navigator.clipboard.writeText(txt);
+  document.getElementById('status-text').textContent = 'Skopiowano adres do schowka!';
+}
+
+startNewSession();
+</script>
+</body>
+</html>
