@@ -6,8 +6,10 @@ import os
 import re
 import ssl
 import time
+import urllib.error
+import urllib.request
 from pathlib import Path
-from typing import Optional
+from typing import Any, Dict, Optional
 
 from aiosmtpd.controller import Controller
 from aiosmtpd.smtp import Envelope, Session, SMTP
@@ -28,6 +30,11 @@ AUDIT_DIR.mkdir(parents=True, exist_ok=True)
 
 TLS_CERT_PATH = os.getenv("JASMINA_TLS_CERT", "/opt/jasmina/certs/fullchain.pem")
 TLS_KEY_PATH = os.getenv("JASMINA_TLS_KEY", "/opt/jasmina/certs/privkey.pem")
+
+WP_WEBHOOK_URL = os.getenv(
+    "JASMINA_WP_URL", "https://s1.kmucha.pl/wp-json/jasmina/v1/audits"
+)
+WP_API_KEY = os.getenv("JASMINA_WP_KEY", "")
 
 TOKEN_PATTERN = re.compile(
     rf"^audit-([a-zA-Z0-9_-]+)@{re.escape(AUDIT_DOMAIN)}$", re.IGNORECASE
@@ -68,6 +75,54 @@ def _extract_valid_token(rcpt_to: str) -> Optional[str]:
         return token
     except Exception:
         return None
+
+
+def _push_audit_to_wp(token: str, address: str, report: Dict[str, Any]) -> None:
+    """Wysyła gotowy raport audytu do REST API wtyczki WordPress na s1.kmucha.pl."""
+    if not WP_API_KEY:
+        logger.debug("JASMINA_WP_KEY not set — skipping WordPress archive sync")
+        return
+    if not WP_WEBHOOK_URL:
+        return
+
+    payload = json.dumps(
+        {
+            "token": token,
+            "address": address.strip().strip("<>").lower(),
+            "report": report,
+        },
+        ensure_ascii=False,
+    ).encode("utf-8")
+
+    req = urllib.request.Request(
+        WP_WEBHOOK_URL,
+        data=payload,
+        headers={
+            "Content-Type": "application/json; charset=utf-8",
+            "X-Jasmina-Key": WP_API_KEY,
+            "User-Agent": "Jasmina-SMTP-Daemon/1.1",
+        },
+        method="POST",
+    )
+
+    try:
+        with urllib.request.urlopen(req, timeout=6) as resp:
+            logger.info(
+                "Synced audit token=%s to WP (%s) -> HTTP %s",
+                token,
+                WP_WEBHOOK_URL,
+                resp.status,
+            )
+    except urllib.error.HTTPError as http_err:
+        err_body = http_err.read(300).decode("utf-8", errors="replace")
+        logger.warning(
+            "WP sync HTTP %s for token=%s: %s",
+            http_err.code,
+            token,
+            err_body,
+        )
+    except Exception as exc:
+        logger.warning("Failed to sync audit token=%s to WP: %s", token, exc)
 
 
 class JasminaSMTPHandler:
@@ -123,11 +178,21 @@ class JasminaSMTPHandler:
                     client_ip=peer_ip,
                     tls_info=tls_desc,
                 )
-                if save_audit_result(token=token, report=report, data_dir=str(AUDIT_DIR)):
+                if save_audit_result(
+                    token=token, report=report, data_dir=str(AUDIT_DIR)
+                ):
                     processed += 1
-                    logger.info("Audit report saved for token=%s (score=%s)", token, report.get("score"))
+                    logger.info(
+                        "Audit report saved locally for token=%s (score=%s)",
+                        token,
+                        report.get("score"),
+                    )
+                    # Asynchroniczna archiwizacja w bazie WordPress na s1.kmucha.pl
+                    await asyncio.to_thread(_push_audit_to_wp, token, rcpt, report)
             except Exception as exc:
-                logger.exception("Failed to analyze email for token=%s: %s", token, exc)
+                logger.exception(
+                    "Failed to analyze email for token=%s: %s", token, exc
+                )
 
         if processed == 0:
             return "550 5.7.1 No active audit session matched"
@@ -138,6 +203,11 @@ class JasminaSMTPHandler:
 async def main() -> None:
     ssl_context = _build_ssl_context()
     handler = JasminaSMTPHandler()
+
+    if WP_API_KEY:
+        logger.info("WordPress archive sync enabled -> %s", WP_WEBHOOK_URL)
+    else:
+        logger.warning("JASMINA_WP_KEY is empty — WordPress archive sync disabled")
 
     controller = Controller(
         handler,
