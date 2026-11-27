@@ -1,77 +1,163 @@
+# smtp_daemon.py
 import asyncio
-import ssl
-import re
+import json
 import logging
+import os
+import re
+import ssl
+import time
+from pathlib import Path
+from typing import Optional
+
 from aiosmtpd.controller import Controller
-from core import init_db, analyze_and_save, DOMAIN
+from aiosmtpd.smtp import Envelope, Session, SMTP
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [SMTP] %(message)s")
+from core import analyze_email, save_audit_result
 
-def extract_real_ip(peer_ip: str, raw_bytes: bytes) -> str:
-    if peer_ip not in ("127.0.0.1", "::1", "unknown"):
-        return peer_ip
-    text = raw_bytes.decode("utf-8", errors="ignore")
-    for line in text.splitlines():
-        if line.lower().startswith("received:"):
-            m = re.search(r"\[(\d{1,3}(?:\.\d{1,3}){3})\]", line)
-            if m and not m.group(1).startswith(("127.", "10.", "192.168.")):
-                return m.group(1)
-    return peer_ip
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] jasmina-smtp: %(message)s",
+)
+logger = logging.getLogger("jasmina-smtp")
 
-class JasminaHandler:
-    async def handle_RCPT(self, server, session, envelope, address, rcpt_options):
-        if not address.lower().endswith(f"@{DOMAIN}"):
-            return "550 5.1.1 Relay access denied"
+SMTP_HOST = os.getenv("JASMINA_SMTP_HOST", "127.0.0.1")
+SMTP_PORT = int(os.getenv("JASMINA_SMTP_PORT", "2525"))
+AUDIT_DOMAIN = os.getenv("JASMINA_DOMAIN", "jasmina.kmucha.pl").lower()
+AUDIT_DIR = Path(os.getenv("JASMINA_DATA_DIR", "/tmp/jasmina_audits"))
+AUDIT_DIR.mkdir(parents=True, exist_ok=True)
+
+TLS_CERT_PATH = os.getenv("JASMINA_TLS_CERT", "/opt/jasmina/certs/fullchain.pem")
+TLS_KEY_PATH = os.getenv("JASMINA_TLS_KEY", "/opt/jasmina/certs/privkey.pem")
+
+TOKEN_PATTERN = re.compile(
+    rf"^audit-([a-zA-Z0-9_-]+)@{re.escape(AUDIT_DOMAIN)}$", re.IGNORECASE
+)
+
+
+def _build_ssl_context() -> Optional[ssl.SSLContext]:
+    cert_file = Path(TLS_CERT_PATH)
+    key_file = Path(TLS_KEY_PATH)
+    if cert_file.exists() and key_file.exists():
+        ctx = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
+        ctx.load_cert_chain(certfile=str(cert_file), keyfile=str(key_file))
+        logger.info("STARTTLS enabled using %s", cert_file)
+        return ctx
+    logger.warning(
+        "TLS cert/key not found (%s, %s) — running without STARTTLS",
+        cert_file,
+        key_file,
+    )
+    return None
+
+
+def _extract_valid_token(rcpt_to: str) -> Optional[str]:
+    clean_addr = rcpt_to.strip().strip("<>").lower()
+    match = TOKEN_PATTERN.match(clean_addr)
+    if not match:
+        return None
+
+    token = match.group(1)
+    session_file = AUDIT_DIR / f"{token}.json"
+    if not session_file.exists():
+        return None
+
+    try:
+        data = json.loads(session_file.read_text(encoding="utf-8"))
+        if data.get("expires_at", 0) < time.time():
+            return None
+        return token
+    except Exception:
+        return None
+
+
+class JasminaSMTPHandler:
+    async def handle_RCPT(
+        self,
+        server: SMTP,
+        session: Session,
+        envelope: Envelope,
+        address: str,
+        rcpt_options: list[str],
+    ) -> str:
+        token = _extract_valid_token(address)
+        if not token:
+            logger.info("Rejected RCPT TO <%s> (unknown or expired token)", address)
+            return "550 5.1.1 Unknown or expired audit recipient"
+
         envelope.rcpt_tos.append(address)
         return "250 OK"
 
-    async def handle_DATA(self, server, session, envelope):
-        raw_peer = session.peer[0] if session.peer else "unknown"
-        peer_ip = extract_real_ip(raw_peer, envelope.original_content)
-        tls_info = {"encrypted": bool(session.ssl), "protocol": "TLS (STARTTLS)" if session.ssl else None, "cipher": None}
+    async def handle_DATA(
+        self,
+        server: SMTP,
+        session: Session,
+        envelope: Envelope,
+    ) -> str:
+        peer_ip = session.peer[0] if session.peer else ""
+        tls_desc = ""
+        if session.ssl:
+            cipher = session.ssl.get("cipher")
+            if isinstance(cipher, tuple) and len(cipher) >= 2:
+                tls_desc = f"{cipher[1]} ({cipher[0]})"
 
-        if isinstance(session.ssl, dict):
-            tls_info["protocol"] = session.ssl.get("protocol") or session.ssl.get("version") or "TLS (STARTTLS)"
-            c = session.ssl.get("cipher")
-            tls_info["cipher"] = c[0] if isinstance(c, (tuple, list)) and c else str(c or "")
+        raw_bytes = envelope.original_content or b""
+        mail_from = envelope.mail_from or ""
 
-        transport = getattr(server, "transport", None)
-        if transport:
-            ssl_obj = transport.get_extra_info("ssl_object")
-            if ssl_obj:
-                tls_info["encrypted"] = True
-                tls_info["protocol"] = ssl_obj.version()
-                c = ssl_obj.cipher()
-                if c:
-                    tls_info["cipher"] = c[0]
-
+        processed = 0
         for rcpt in envelope.rcpt_tos:
-            token = rcpt.split("@")[0].lower()
-            logging.info(f"Odebrano audyt dla {rcpt} z {peer_ip} (TLS: {tls_info['protocol']})")
-            loop = asyncio.get_running_loop()
-            await loop.run_in_executor(None, analyze_and_save, token, envelope.original_content, peer_ip, tls_info)
+            token = _extract_valid_token(rcpt)
+            if not token:
+                continue
 
-        return "250 Message accepted for security audit"
+            logger.info(
+                "Auditing message for token=%s from=<%s> ip=%s tls=%s",
+                token,
+                mail_from,
+                peer_ip,
+                tls_desc or "none",
+            )
+            try:
+                report = analyze_email(
+                    raw_bytes=raw_bytes,
+                    mail_from=mail_from,
+                    client_ip=peer_ip,
+                    tls_info=tls_desc,
+                )
+                if save_audit_result(token=token, report=report, data_dir=str(AUDIT_DIR)):
+                    processed += 1
+                    logger.info("Audit report saved for token=%s (score=%s)", token, report.get("score"))
+            except Exception as exc:
+                logger.exception("Failed to analyze email for token=%s: %s", token, exc)
 
-def main():
-    init_db()
-    ssl_ctx = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
-    ssl_ctx.load_cert_chain(
-        certfile="/etc/letsencrypt/live/jasmina.kmucha.pl/fullchain.pem",
-        keyfile="/etc/letsencrypt/live/jasmina.kmucha.pl/privkey.pem",
+        if processed == 0:
+            return "550 5.7.1 No active audit session matched"
+
+        return "250 2.0.0 OK: Audit processed"
+
+
+async def main() -> None:
+    ssl_context = _build_ssl_context()
+    handler = JasminaSMTPHandler()
+
+    controller = Controller(
+        handler,
+        hostname=SMTP_HOST,
+        port=SMTP_PORT,
+        tls_context=ssl_context,
+        require_starttls=False,
     )
-    kw = dict(ident=f"{DOMAIN} ESMTP", server_kwargs={"hostname": DOMAIN}, tls_context=ssl_ctx, require_starttls=False, auth_exclude_mechanism=["LOGIN", "PLAIN"])
-    c1 = Controller(JasminaHandler(), hostname="::", port=25, **kw)
-    c2 = Controller(JasminaHandler(), hostname="127.0.0.1", port=2525, **kw)
-    c1.start()
-    c2.start()
-    logging.info(f"Odbiornik SMTP uruchomiony dla {DOMAIN}")
-    loop = asyncio.new_event_loop()
+    controller.start()
+    logger.info("Listening on %s:%s for @%s", SMTP_HOST, SMTP_PORT, AUDIT_DOMAIN)
+
     try:
-        loop.run_forever()
+        while True:
+            await asyncio.sleep(3600)
+    except (KeyboardInterrupt, asyncio.CancelledError):
+        pass
     finally:
-        c1.stop()
-        c2.stop()
+        controller.stop()
+        logger.info("SMTP daemon stopped")
+
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
