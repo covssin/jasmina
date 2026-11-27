@@ -35,3 +35,19 @@ def check_session(token: str):
         "remaining": remaining,
         "report": json.loads(row["report_json"]) if row["report_json"] else None
     }
+# Fragment web_app.py
+from fastapi import Request
+from i18n import get_t, TRANSLATIONS
+
+@app.get("/")
+async def index(request: Request, lang: str = "pl"):
+    lang = lang if lang in TRANSLATIONS else "pl"
+    return templates.TemplateResponse(
+        "index.html",
+        {
+            "request": request,
+            "lang": lang,
+            "t": get_t(lang),
+            "translations_json": TRANSLATIONS[lang],  # dla skryptów JS po stronie klienta
+        }
+    )
