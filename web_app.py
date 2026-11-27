@@ -49,9 +49,9 @@ async def index(request: Request, response: Response, lang: str | None = None):
     t = get_translations(active_lang)
 
     html_response = templates.TemplateResponse(
-        "index.html",
-        {
-            "request": request,
+        request=request,
+        name="index.html",
+        context={
             "lang": active_lang,
             "t": t,
             "translations_json": t,
@@ -72,7 +72,7 @@ async def index(request: Request, response: Response, lang: str | None = None):
 @app.post("/api/session")
 async def create_session(request: Request) -> JSONResponse:
     _cleanup_expired()
-    token = secrets.token_hex(6)  # np. 12 znaków hex
+    token = secrets.token_hex(6)
     now = int(time.time())
     expires_at = now + AUDIT_TTL_SECONDS
     address = f"audit-{token}@{AUDIT_DOMAIN}"
